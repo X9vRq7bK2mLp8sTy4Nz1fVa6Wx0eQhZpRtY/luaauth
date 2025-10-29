@@ -1,13 +1,18 @@
+// /api/index.js
 const express = require('express');
+const path = require('path');
 const { v4: uuid } = require('uuid');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const connectToMongo = require('./mongo.js');
-const { base64Encode, hmacSha256 } = require('./encryption.js');
-const { isAllowedUA } = require('./utils.js');
+const connectToMongo = require('../mongo.js');
+const { base64Encode, hmacSha256 } = require('../encryption.js');
+const { isAllowedUA } = require('../utils.js');
 
 const app = express();
 app.use(express.json());
+
+// serve static files (optional if you want /public as root)
+app.use(express.static(path.join(__dirname, '..')));
 
 const MONGO_URI = process.env.MONGO_URI;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
@@ -47,7 +52,8 @@ app.use(async (req, res, next) => {
   }
 });
 
-app.post('/api/admin/login', async (req, res) => {
+// admin login
+app.post('/admin/login', async (req, res) => {
   const { username, password } = req.body;
   const admins = db.collection('secure_lua_admins_v3');
   const admin = await admins.findOne({ username });
@@ -59,7 +65,8 @@ app.post('/api/admin/login', async (req, res) => {
   res.json({ sessionToken });
 });
 
-app.post('/api/admin/create', async (req, res) => {
+// admin create script
+app.post('/admin/create', async (req, res) => {
   const { payload } = req.body;
   const sessionToken = req.headers['x-session-token'];
   const admins = db.collection('secure_lua_admins_v3');
@@ -72,78 +79,104 @@ app.post('/api/admin/create', async (req, res) => {
   res.json({ rawUrl });
 });
 
-app.get('/api/raw/:id', async (req, res) => {
+// generate loader
+app.get('/raw/:id', async (req, res) => {
   const { id } = req.params;
   const userAgent = req.headers['user-agent'];
   if (!isAllowedUA(userAgent)) return res.status(403).send('Forbidden');
   const scripts = db.collection('secure_lua_scripts_v3');
   const script = await scripts.findOne({ id });
   if (!script) return res.status(404).send('Not found');
+
   const token = crypto.randomBytes(16).toString('hex');
   const nonce = crypto.randomBytes(16).toString('hex');
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 30000);
+  const expiresAt = new Date(now.getTime() + 30000); // 30 sec TTL
+
   const runs = db.collection('secure_lua_runs_v3');
   await runs.insertOne({ token, nonce, scriptId: id, expiresAt, used: false });
+
   const host = req.headers.host;
-  const loader = `
--- Suppress print and warn
-local oldprint = print
-local oldwarn = warn
+
+  // loaderPayload: actual lua executed by executor
+  const loaderPayload = `
+local HttpService = game:GetService("HttpService")
+if not HttpService or type(HttpService.RequestAsync) ~= "function" then error("env fail",2) end
+local playerId = (game.Players.LocalPlayer and game.Players.LocalPlayer.UserId) or 0
+local token = "${token}"
+local blobUrl = "https://${host}/api/blob/${id}"
+
+local function fetch()
+  local ok, res = pcall(function()
+    return HttpService:RequestAsync({
+      Url = blobUrl,
+      Method = "GET",
+      Headers = {
+        ["User-Agent"] = "roblox",
+        ["x-run-token"] = token,
+        ["x-player-id"] = tostring(playerId)
+      },
+      Timeout = 10
+    })
+  end)
+  if not ok or not res or res.StatusCode ~= 200 then
+    error("loader fetch failed: "..tostring(res and res.StatusCode or ok), 2)
+  end
+  return res.Body
+end
+
+local oldPrint, oldWarn = print, warn
 print = function() end
 warn = function() end
 
--- Environment checks
-if not game or not game.Players or not game.Players.LocalPlayer then return end
+local ok, err = pcall(function()
+  local body = fetch()
+  loadstring(body)()
+end)
 
-local playerId = tostring(game.Players.LocalPlayer.UserId)
+print, warn = oldPrint, oldWarn
+if not ok then error("tamper/fetch fail: "..tostring(err), 2) end
+`;
 
-local token = "${token}"
-local nonce = "${nonce}"
-local ts = os.time()
-
-local data = token .. nonce .. playerId .. tostring(ts)
-local proof = hmac_sha256(token, data)  -- Implement pure Lua HMAC-SHA256 here or assume executor provides it
-
-local headers = {
-  ["x-run-token"] = token,
-  ["x-run-proof"] = proof,
-  ["x-ts"] = tostring(ts),
-  ["x-player-id"] = playerId
-}
-
-local response = game:HttpGetAsync("https://${host}/api/blob/${id}", headers)  -- Adjust to actual RequestAsync if needed
-
-if not response or response.StatusCode ~= 200 then 
-  oldprint("Error: " .. (response and response.StatusCode or "No response"))
-  return 
+  // wrap in base64 decoder
+  const b64Encoded = base64Encode(loaderPayload);
+  const loader = `
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function b64decode(s)
+  s = string.gsub(s, '[^'..b..'=]', '')
+  return (s:gsub('.', function(x)
+    if x == '=' then return '' end
+    local r,f='',(b:find(x)-1)
+    for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+    return r;
+  end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+    if #x ~= 8 then return '' end
+    local c=0
+    for i=1,8 do c=c + (x:sub(i,i)=='1' and 2^(8-i) or 0) end
+    return string.char(c)
+  end))
 end
 
-local body = response.Body
-
--- Restore print and warn
-print = oldprint
-warn = oldwarn
-
-loadstring(body)()
+local payload = b64decode("${b64Encoded}")
+local fn, err = loadstring(payload)
+if not fn then error("loader decode failed: "..tostring(err), 2) end
+fn()
 `;
-  const obfuscatedLoader = base64Encode(loader);
+
   res.setHeader('Content-Type', 'text/plain');
-  res.send(obfuscatedLoader);
+  res.send(loader);
 });
 
-app.get('/api/blob/:id', async (req, res) => {
+// blob endpoint
+app.get('/blob/:id', async (req, res) => {
   const { id } = req.params;
   const userAgent = req.headers['user-agent'];
   if (!isAllowedUA(userAgent)) return res.status(403).send('Forbidden');
+
   const token = req.headers['x-run-token'];
-  const proof = req.headers['x-run-proof'];
-  const tsStr = req.headers['x-ts'];
   const playerId = req.headers['x-player-id'];
-  if (!token || !proof || !tsStr || !playerId) return res.status(403).send('Missing headers');
-  const ts = parseInt(tsStr);
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - ts) > 5) return res.status(403).send('Invalid timestamp');
+  if (!token || !playerId) return res.status(403).send('Missing headers');
+
   const runs = db.collection('secure_lua_runs_v3');
   const run = await runs.findOneAndUpdate(
     { token, scriptId: id, used: false, expiresAt: { $gt: new Date() } },
@@ -151,13 +184,11 @@ app.get('/api/blob/:id', async (req, res) => {
     { returnDocument: 'before' }
   );
   if (!run.value) return res.status(403).send('Invalid token');
-  const nonce = run.value.nonce;
-  const data = token + nonce + playerId + tsStr;
-  const expected = hmacSha256(token, data);
-  if (expected !== proof) return res.status(403).send('Invalid proof');
+
   const scripts = db.collection('secure_lua_scripts_v3');
   const script = await scripts.findOne({ id });
   if (!script) return res.status(404).send('Not found');
+
   res.setHeader('Content-Type', 'text/plain');
   res.send(script.payload);
 });
