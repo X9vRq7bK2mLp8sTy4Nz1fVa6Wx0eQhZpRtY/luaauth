@@ -1,43 +1,24 @@
-<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>lua protect admin</title>
-<style>
-:root{--bg:#07101a;--panel:#0b1620;--muted:#9aa4b2;--accent:#06b6d4;--text:#e6eef6}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui;display:flex;align-items:flex-start;justify-content:center}
-.wrap{width:940px;margin:28px;padding:20px;background:linear-gradient(0deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px}
-h1{margin:0;font-size:20px}
-.input{background:#08121a;border:1px solid rgba(255,255,255,0.03);padding:10px;border-radius:8px;color:var(--text);font-family:ui-monospace,monospace}
-.textarea{height:240px;resize:vertical;width:100%;padding:10px;border-radius:8px;background:#08121a;color:var(--text);border:1px solid rgba(255,255,255,0.03)}
-.btn{background:linear-gradient(180deg,var(--accent),#08a0c0);padding:9px 12px;border-radius:8px;border:none;color:#022;cursor:pointer;font-weight:700}
-.small{font-size:13px;color:var(--muted)}
-pre#out{background:#07121a;padding:12px;border-radius:8px;margin-top:12px;white-space:pre-wrap;color:var(--text);min-height:60px}
-.copy{background:#052a2f;padding:6px 8px;border-radius:6px;cursor:pointer;color:var(--accent)}
-.row{display:flex;gap:8px;align-items:center;margin-top:10px}
-</style></head><body>
-<div class="wrap">
-  <h1>lua protect — admin</h1>
-  <div class="small">default admin: set via env (admin/admin if left default)</div>
-
-  <div class="row" style="margin-top:12px">
-    <input id="user" class="input" placeholder="username" value="admin" style="width:180px"/>
-    <input id="pass" class="input" placeholder="password" value="admin" style="width:180px"/>
-    <button id="login" class="btn">login</button>
-    <div id="loginStatus" class="small" style="margin-left:12px"></div>
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Lua Script Protector</title>
+  <script src="/admin.js"></script>
+  <style>
+    body { font-family: Arial; margin: 20px; }
+    input, textarea { display: block; margin: 10px 0; }
+    textarea { width: 500px; height: 300px; }
+  </style>
+</head>
+<body>
+  <div id="login">
+    <input id="username" placeholder="Username">
+    <input id="password" type="password" placeholder="Password">
+    <button onclick="login()">Login</button>
   </div>
-
-  <label class="small" style="margin-top:12px">obfuscated payload (paste obf code)</label>
-  <textarea id="code" class="textarea" placeholder="paste obfuscated lua"></textarea>
-
-  <div class="row">
-    <input id="title" class="input" placeholder="title (optional)" style="flex:1"/>
-    <button id="create" class="btn">create loader</button>
-    <button id="clear" class="btn" style="background:transparent;border:1px solid rgba(255,255,255,0.03);color:var(--muted)">clear</button>
+  <div id="admin" style="display:none;">
+    <textarea id="payload" placeholder="Paste obfuscated Lua script"></textarea>
+    <button onclick="createScript()">Create</button>
+    <div id="url"></div>
   </div>
-
-  <pre id="out">paste obf code and press create. loader link will appear here.</pre>
-
-  <div id="meta" style="display:none;margin-top:12px;align-items:center;gap:8px;display:flex">
-    <div class="small">loader url</div><a id="loaderLink" style="color:var(--accent);word-break:break-all"></a>
-    <div id="copyBtn" class="copy">copy</div>
-  </div>
-</div>
-<script src="/static/admin.js"></script>
-</body></html>
+</body>
+</html>
