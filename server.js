@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const { v4: uuid } = require('uuid');
 const bcrypt = require('bcryptjs');
@@ -9,23 +8,44 @@ const { isAllowedUA } = require('./utils.js');
 
 const app = express();
 app.use(express.json());
-app.use(express.static('static'));
 
 const MONGO_URI = process.env.MONGO_URI;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 
-let db;
+let db = null;
+let initPromise = null;
 
-(async () => {
-  db = await connectToMongo(MONGO_URI);
-  const admins = db.collection('secure_lua_admins_v3');
-  const admin = await admins.findOne({ username: ADMIN_USERNAME });
-  if (!admin) {
-    const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    await admins.insertOne({ username: ADMIN_USERNAME, passwordHash: hash, sessionToken: null });
+async function initDb() {
+  if (db) return db;
+  if (!initPromise) {
+    initPromise = (async () => {
+      try {
+        db = await connectToMongo(MONGO_URI);
+        const admins = db.collection('secure_lua_admins_v3');
+        const admin = await admins.findOne({ username: ADMIN_USERNAME });
+        if (!admin) {
+          const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+          await admins.insertOne({ username: ADMIN_USERNAME, passwordHash: hash, sessionToken: null });
+        }
+        return db;
+      } catch (err) {
+        console.error('Failed to connect to MongoDB:', err);
+        throw err;
+      }
+    })();
   }
-})();
+  return initPromise;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await initDb();
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Database connection failed' });
+  }
+});
 
 app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
@@ -83,7 +103,7 @@ local nonce = "${nonce}"
 local ts = os.time()
 
 local data = token .. nonce .. playerId .. tostring(ts)
-local proof = hmac_sha256(token, data)  -- Pure Lua HMAC-SHA256 function required here
+local proof = hmac_sha256(token, data)  -- Implement pure Lua HMAC-SHA256 here or assume executor provides it
 
 local headers = {
   ["x-run-token"] = token,
@@ -92,14 +112,10 @@ local headers = {
   ["x-player-id"] = playerId
 }
 
-local response = RequestAsync({
-  Url = "https://${host}/api/blob/${id}",
-  Method = "GET",
-  Headers = headers
-})
+local response = game:HttpGetAsync("https://${host}/api/blob/${id}", headers)  -- Adjust to actual RequestAsync if needed
 
-if response.StatusCode ~= 200 then 
-  oldprint("Error: " .. response.StatusCode)
+if not response or response.StatusCode ~= 200 then 
+  oldprint("Error: " .. (response and response.StatusCode or "No response"))
   return 
 end
 
@@ -134,8 +150,8 @@ app.get('/api/blob/:id', async (req, res) => {
     { $set: { used: true, usedAt: new Date(), usedBy: playerId } },
     { returnDocument: 'before' }
   );
-  if (!run) return res.status(403).send('Invalid token');
-  const nonce = run.nonce;
+  if (!run.value) return res.status(403).send('Invalid token');
+  const nonce = run.value.nonce;
   const data = token + nonce + playerId + tsStr;
   const expected = hmacSha256(token, data);
   if (expected !== proof) return res.status(403).send('Invalid proof');
@@ -146,5 +162,4 @@ app.get('/api/blob/:id', async (req, res) => {
   res.send(script.payload);
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+module.exports = app;
