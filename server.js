@@ -1,146 +1,150 @@
-// server.js - minimal, uses only MONGO_URI + ADMIN_USERNAME + ADMIN_PASSWORD from env
 require('dotenv').config();
 const express = require('express');
+const { v4: uuid } = require('uuid');
 const bcrypt = require('bcryptjs');
-const { v4: uuidv4 } = require('uuid');
-const { init } = require('./mongo');
-const { obfuscateBase64, genToken } = require('./encryption');
+const crypto = require('crypto');
+const connectToMongo = require('./mongo.js');
+const { base64Encode, hmacSha256 } = require('./encryption.js');
+const { isAllowedUA } = require('./utils.js');
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const RUN_TOKEN_BYTES = 16;
-const TOKEN_TTL_MS = 30000;
+const app = express();
+app.use(express.json());
+app.use(express.static('static'));
+
+const MONGO_URI = process.env.MONGO_URI;
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+
+let db;
 
 (async () => {
-  const { db, scripts, runs, admins } = await init();
-  const app = express();
-  app.use(express.json({ limit: '1mb' }));
-  app.use(express.static('static'));
-
-  // ensure default admin exists or create from env
-  const adminUser = process.env.ADMIN_USERNAME || 'admin';
-  const adminPass = process.env.ADMIN_PASSWORD || 'admin';
-  const existing = await admins.findOne({ username: adminUser });
-  if (!existing) {
-    const hash = bcrypt.hashSync(adminPass, 8);
-    await admins.insertOne({ username: adminUser, passwordHash: hash, createdAt: new Date() });
-    console.log('created default admin:', adminUser);
+  db = await connectToMongo(MONGO_URI);
+  const admins = db.collection('secure_lua_admins_v3');
+  const admin = await admins.findOne({ username: ADMIN_USERNAME });
+  if (!admin) {
+    const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+    await admins.insertOne({ username: ADMIN_USERNAME, passwordHash: hash, sessionToken: null });
   }
-
-  function baseUrl(req) {
-    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-    const host = req.headers['x-forwarded-host'] || req.headers.host;
-    return `${proto}://${host}`;
-  }
-
-  // admin login (returns session token stored in admin doc)
-  app.post('/api/admin/login', async (req, res) => {
-    try {
-      const { username, password } = req.body || {};
-      if (!username || !password) return res.status(400).json({ error: 'missing' });
-      const user = await admins.findOne({ username });
-      if (!user) return res.status(401).json({ error: 'invalid' });
-      if (!bcrypt.compareSync(password, user.passwordHash)) return res.status(401).json({ error: 'invalid' });
-      const sessionToken = genToken(12);
-      await admins.updateOne({ username }, { $set: { sessionToken, sessionAt: new Date() } });
-      return res.json({ ok: true, sessionToken, username });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: 'internal' });
-    }
-  });
-
-  // create script (admin only). accepts obfuscated payload (string).
-  app.post('/api/create', async (req, res) => {
-    try {
-      const session = req.headers['x-session-token'] || req.body.sessionToken;
-      if (!session) return res.status(401).json({ error: 'unauthenticated' });
-      const admin = await admins.findOne({ sessionToken: session });
-      if (!admin) return res.status(401).json({ error: 'unauthenticated' });
-
-      const { title, obfCode } = req.body;
-      if (!obfCode || typeof obfCode !== 'string') return res.status(400).json({ error: 'missing obfCode' });
-
-      const id = uuidv4();
-      await scripts.insertOne({ _id: id, title: title || '(no title)', obfPayload: obfCode, createdAt: new Date() });
-      return res.status(201).json({ id, rawUrl: `${baseUrl(req)}/api/raw/${id}` });
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: 'internal' });
-    }
-  });
-
-  // raw: returns obf-loader and creates one-use run token. no browser UA checks here (you asked to remove complex env vars)
-  app.get('/api/raw/:id', async (req, res) => {
-    try {
-      const id = req.params.id;
-      const script = await scripts.findOne({ _id: id });
-      if (!script) return res.status(404).send('not found');
-
-      const token = genToken(RUN_TOKEN_BYTES);
-      const now = Date.now();
-      const expiresAt = new Date(now + TOKEN_TTL_MS);
-      await runs.insertOne({ token, scriptId: id, used: false, createdAt: new Date(now), expiresAt });
-
-      const blobUrl = `${baseUrl(req)}/api/blob/${id}`;
-      const loaderPlain = `
-local HttpService = game:GetService("HttpService")
-if not HttpService or type(HttpService.RequestAsync) ~= "function" then error("env fail",2) end
-local playerId = (game.Players.LocalPlayer and game.Players.LocalPlayer.UserId) or 0
-local function fetch()
-  local ok,res = pcall(function()
-    return HttpService:RequestAsync({
-      Url = "${blobUrl}",
-      Method = "GET",
-      Headers = {
-        ["User-Agent"] = "roblox",
-        ["x-run-token"] = "${token}",
-        ["x-player-id"] = tostring(playerId)
-      },
-      Timeout = 10
-    })
-  end)
-  if not ok or not res or res.StatusCode ~= 200 then error("loader fetch failed: "..tostring(res and res.StatusCode or ok),2) end
-  return res.Body
-end
-local oldPrint,oldWarn=print,warn
-print=function() end; warn=function() end
-local ok,err = pcall(function() local body = fetch(); loadstring(body)() end)
-print=oldPrint; warn=oldWarn
-if not ok then error("tamper/fetch fail: "..tostring(err),2) end
-`.trim();
-
-      const obfLoader = obfuscateBase64(loaderPlain);
-      res.setHeader('content-type', 'text/plain');
-      return res.status(200).send(obfLoader);
-    } catch (e) {
-      console.error(e);
-      return res.status(500).send('internal');
-    }
-  });
-
-  // blob: consume token atomically and return obf payload
-  app.get('/api/blob/:id', async (req, res) => {
-    try {
-      const id = req.params.id;
-      const token = req.headers['x-run-token'];
-      if (!token) return res.status(403).end('missing token');
-
-      const now = new Date();
-      const filter = { token, scriptId: id, used: false, expiresAt: { $gt: now } };
-      const update = { $set: { used: true, usedAt: now } };
-      const r = await runs.findOneAndUpdate(filter, update, { returnDocument: 'after' });
-      if (!r.value) return res.status(403).end('invalid or used token');
-
-      const script = await scripts.findOne({ _id: id });
-      if (!script || !script.obfPayload) return res.status(404).end('payload not found');
-
-      res.setHeader('content-type', 'text/plain');
-      return res.status(200).send(script.obfPayload);
-    } catch (e) {
-      console.error(e);
-      return res.status(500).end('internal');
-    }
-  });
-
-  app.listen(PORT, () => console.log('listening', PORT));
 })();
+
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body;
+  const admins = db.collection('secure_lua_admins_v3');
+  const admin = await admins.findOne({ username });
+  if (!admin || !await bcrypt.compare(password, admin.passwordHash)) {
+    return res.json({ error: 'Invalid credentials' });
+  }
+  const sessionToken = uuid();
+  await admins.updateOne({ username }, { $set: { sessionToken } });
+  res.json({ sessionToken });
+});
+
+app.post('/api/admin/create', async (req, res) => {
+  const { payload } = req.body;
+  const sessionToken = req.headers['x-session-token'];
+  const admins = db.collection('secure_lua_admins_v3');
+  const admin = await admins.findOne({ sessionToken });
+  if (!admin) return res.status(403).json({ error: 'Unauthorized' });
+  const scripts = db.collection('secure_lua_scripts_v3');
+  const id = uuid();
+  await scripts.insertOne({ id, payload });
+  const rawUrl = `https://${req.headers.host}/api/raw/${id}`;
+  res.json({ rawUrl });
+});
+
+app.get('/api/raw/:id', async (req, res) => {
+  const { id } = req.params;
+  const userAgent = req.headers['user-agent'];
+  if (!isAllowedUA(userAgent)) return res.status(403).send('Forbidden');
+  const scripts = db.collection('secure_lua_scripts_v3');
+  const script = await scripts.findOne({ id });
+  if (!script) return res.status(404).send('Not found');
+  const token = crypto.randomBytes(16).toString('hex');
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30000);
+  const runs = db.collection('secure_lua_runs_v3');
+  await runs.insertOne({ token, nonce, scriptId: id, expiresAt, used: false });
+  const host = req.headers.host;
+  const loader = `
+-- Suppress print and warn
+local oldprint = print
+local oldwarn = warn
+print = function() end
+warn = function() end
+
+-- Environment checks
+if not game or not game.Players or not game.Players.LocalPlayer then return end
+
+local playerId = tostring(game.Players.LocalPlayer.UserId)
+
+local token = "${token}"
+local nonce = "${nonce}"
+local ts = os.time()
+
+local data = token .. nonce .. playerId .. tostring(ts)
+local proof = hmac_sha256(token, data)  -- Pure Lua HMAC-SHA256 function required here
+
+local headers = {
+  ["x-run-token"] = token,
+  ["x-run-proof"] = proof,
+  ["x-ts"] = tostring(ts),
+  ["x-player-id"] = playerId
+}
+
+local response = RequestAsync({
+  Url = "https://${host}/api/blob/${id}",
+  Method = "GET",
+  Headers = headers
+})
+
+if response.StatusCode ~= 200 then 
+  oldprint("Error: " .. response.StatusCode)
+  return 
+end
+
+local body = response.Body
+
+-- Restore print and warn
+print = oldprint
+warn = oldwarn
+
+loadstring(body)()
+`;
+  const obfuscatedLoader = base64Encode(loader);
+  res.setHeader('Content-Type', 'text/plain');
+  res.send(obfuscatedLoader);
+});
+
+app.get('/api/blob/:id', async (req, res) => {
+  const { id } = req.params;
+  const userAgent = req.headers['user-agent'];
+  if (!isAllowedUA(userAgent)) return res.status(403).send('Forbidden');
+  const token = req.headers['x-run-token'];
+  const proof = req.headers['x-run-proof'];
+  const tsStr = req.headers['x-ts'];
+  const playerId = req.headers['x-player-id'];
+  if (!token || !proof || !tsStr || !playerId) return res.status(403).send('Missing headers');
+  const ts = parseInt(tsStr);
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > 5) return res.status(403).send('Invalid timestamp');
+  const runs = db.collection('secure_lua_runs_v3');
+  const run = await runs.findOneAndUpdate(
+    { token, scriptId: id, used: false, expiresAt: { $gt: new Date() } },
+    { $set: { used: true, usedAt: new Date(), usedBy: playerId } },
+    { returnDocument: 'before' }
+  );
+  if (!run) return res.status(403).send('Invalid token');
+  const nonce = run.nonce;
+  const data = token + nonce + playerId + tsStr;
+  const expected = hmacSha256(token, data);
+  if (expected !== proof) return res.status(403).send('Invalid proof');
+  const scripts = db.collection('secure_lua_scripts_v3');
+  const script = await scripts.findOne({ id });
+  if (!script) return res.status(404).send('Not found');
+  res.setHeader('Content-Type', 'text/plain');
+  res.send(script.payload);
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
