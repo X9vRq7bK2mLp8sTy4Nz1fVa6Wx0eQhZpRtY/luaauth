@@ -1,18 +1,15 @@
-// /api/index.js
 const express = require('express');
-const path = require('path');
 const { v4: uuid } = require('uuid');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const connectToMongo = require('../mongo.js');
-const { base64Encode, hmacSha256 } = require('../encryption.js');
-const { isAllowedUA } = require('../utils.js');
+const path = require('path');
+const connectToMongo = require('../mongo.js');          // fixed path
+const { base64Encode, hmacSha256 } = require('../encryption.js'); // fixed path
+const { isAllowedUA } = require('../utils.js');        // fixed path
 
 const app = express();
 app.use(express.json());
-
-// serve static files (optional if you want /public as root)
-app.use(express.static(path.join(__dirname, '..')));
+app.use(express.static(path.join(__dirname, '..')));  // serve static files from root
 
 const MONGO_URI = process.env.MONGO_URI;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
@@ -65,7 +62,7 @@ app.post('/admin/login', async (req, res) => {
   res.json({ sessionToken });
 });
 
-// admin create script
+// create script
 app.post('/admin/create', async (req, res) => {
   const { payload } = req.body;
   const sessionToken = req.headers['x-session-token'];
@@ -79,7 +76,7 @@ app.post('/admin/create', async (req, res) => {
   res.json({ rawUrl });
 });
 
-// generate loader
+// raw endpoint
 app.get('/raw/:id', async (req, res) => {
   const { id } = req.params;
   const userAgent = req.headers['user-agent'];
@@ -91,75 +88,55 @@ app.get('/raw/:id', async (req, res) => {
   const token = crypto.randomBytes(16).toString('hex');
   const nonce = crypto.randomBytes(16).toString('hex');
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 30000); // 30 sec TTL
-
+  const expiresAt = new Date(now.getTime() + 30000);
   const runs = db.collection('secure_lua_runs_v3');
   await runs.insertOne({ token, nonce, scriptId: id, expiresAt, used: false });
 
   const host = req.headers.host;
 
-  // loaderPayload: actual lua executed by executor
+  // loader payload
   const loaderPayload = `
 local HttpService = game:GetService("HttpService")
 if not HttpService or type(HttpService.RequestAsync) ~= "function" then error("env fail",2) end
 local playerId = (game.Players.LocalPlayer and game.Players.LocalPlayer.UserId) or 0
 local token = "${token}"
 local blobUrl = "https://${host}/api/blob/${id}"
-
 local function fetch()
   local ok, res = pcall(function()
-    return HttpService:RequestAsync({
-      Url = blobUrl,
-      Method = "GET",
-      Headers = {
-        ["User-Agent"] = "roblox",
-        ["x-run-token"] = token,
-        ["x-player-id"] = tostring(playerId)
-      },
-      Timeout = 10
-    })
+    return HttpService:RequestAsync({Url = blobUrl, Method = "GET", Headers={["User-Agent"]="roblox", ["x-run-token"]=token, ["x-player-id"]=tostring(playerId)}, Timeout=10})
   end)
-  if not ok or not res or res.StatusCode ~= 200 then
-    error("loader fetch failed: "..tostring(res and res.StatusCode or ok), 2)
-  end
+  if not ok or not res or res.StatusCode ~= 200 then error("loader fetch failed: "..tostring(res and res.StatusCode or ok),2) end
   return res.Body
 end
-
 local oldPrint, oldWarn = print, warn
 print = function() end
 warn = function() end
-
-local ok, err = pcall(function()
-  local body = fetch()
-  loadstring(body)()
-end)
-
+local ok, err = pcall(function() local body = fetch() loadstring(body)() end)
 print, warn = oldPrint, oldWarn
-if not ok then error("tamper/fetch fail: "..tostring(err), 2) end
+if not ok then error("tamper/fetch fail: "..tostring(err),2) end
 `;
 
-  // wrap in base64 decoder
-  const b64Encoded = base64Encode(loaderPayload);
+  const obfuscatedLoader = base64Encode(loaderPayload);
   const loader = `
+-- base64 wrapper
 local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local function b64decode(s)
   s = string.gsub(s, '[^'..b..'=]', '')
   return (s:gsub('.', function(x)
-    if x == '=' then return '' end
+    if x=='=' then return '' end
     local r,f='',(b:find(x)-1)
     for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
     return r;
   end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
-    if #x ~= 8 then return '' end
+    if #x~=8 then return '' end
     local c=0
     for i=1,8 do c=c + (x:sub(i,i)=='1' and 2^(8-i) or 0) end
     return string.char(c)
   end))
 end
-
-local payload = b64decode("${b64Encoded}")
-local fn, err = loadstring(payload)
-if not fn then error("loader decode failed: "..tostring(err), 2) end
+local encoded = "${obfuscatedLoader}"
+local fn, err = loadstring(b64decode(encoded))
+if not fn then error("loader decode failed: "..tostring(err),2) end
 fn()
 `;
 
@@ -172,7 +149,6 @@ app.get('/blob/:id', async (req, res) => {
   const { id } = req.params;
   const userAgent = req.headers['user-agent'];
   if (!isAllowedUA(userAgent)) return res.status(403).send('Forbidden');
-
   const token = req.headers['x-run-token'];
   const playerId = req.headers['x-player-id'];
   if (!token || !playerId) return res.status(403).send('Missing headers');
